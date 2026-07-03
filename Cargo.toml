@@ -1,0 +1,11 @@
+[package]
+name = "codb-gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
