@@ -1,16 +1,20 @@
-//! ポケモンコロシアム「とにかくバトル」seed特定用データベース(FullDB / LightDB)生成ツール。
+//! ポケモンコロシアム「とにかくバトル」seed特定用データベース生成ツール。
 //!
-//! 生成ロジックは PokemonCoRNGLibrary(C#)の RentalTeamRank / GCSlot と一致させている。
-//! - 色回避(採用PIDがトレーナーTSVに対して色違いなら再抽選)を含む
-//! - チーム定義は PokemonCOSeedDataBaseAPI の BattleTeamUltimate に一致
-//!   (旧C++実装のキュウコン性別比 M1F1 は誤りで、正しくは M1F3)
+//! チーム生成ロジックは src/teamgen.rs(PokemonCoRNGLibrary と一致)。
+//! 観測1回 = 組み合わせ画面のチーム生成1回分であり、コードは
+//! COMトレーナー名(3) × 自チーム(8) = 24通り。
 //!
-//! FullDB : 全2^32状態を7バトル分のコードでキー化。ファイル {c5+c6*24}.bin に
+//! FullDB : 全2^32状態を7回のチーム生成コードでキー化。ファイル {c5+c6*24}.bin に
 //!          seedKey = c4 + c3*24 + c2*24^2 + c1*24^3 + c0*24^4 の昇順で seed(u32 LE) のみを格納。
-//! LightDB: 1バトル適用後に到達可能な状態(像)のみを対象に、後続7バトルでキー化。
+//! LightDB: 1回のチーム生成適用後に到達可能な状態(像)のみを対象に、後続7回でキー化。
 //!          ファイル {c1+c2*24}.bin に (seedKey, 生成後seed) (u32 LE ×2) を
 //!          seedKey = c3 + c4*24 + c5*24^2 + c6*24^3 + c7*24^4 の昇順で格納。
 //! いずれも既存の FullDBSearcher / LightDBSearcher と互換。
+//!
+//! 圧縮LightDB(単一ファイル、gen-light / query / verify-light): src/clight.rs 参照。
+
+mod clight;
+mod teamgen;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -19,115 +23,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-const A: u32 = 0x343FD;
-const B: u32 = 0x269EC3;
-
-/// n ステップ分のジャンプ定数 (An, Bn): s' = An*s + Bn
-const fn jump(n: u32) -> (u32, u32) {
-    let (mut ra, mut rb) = (1u32, 0u32);
-    let (mut a, mut b) = (A, B);
-    let mut n = n;
-    while n > 0 {
-        if n & 1 == 1 {
-            ra = ra.wrapping_mul(a);
-            rb = rb.wrapping_mul(a).wrapping_add(b);
-        }
-        b = b.wrapping_mul(a.wrapping_add(1));
-        a = a.wrapping_mul(a);
-        n >>= 1;
-    }
-    (ra, rb)
-}
-
-const J5: (u32, u32) = jump(5); // dummyPID(2) + IVs(2) + ability(1)
-
-#[inline(always)]
-fn rand(s: &mut u32) -> u32 {
-    *s = s.wrapping_mul(A).wrapping_add(B);
-    *s >> 16
-}
-
-/// 固定枠の生成条件。gender: 0=判定なし(性別不明), 1=♂, 2=♀
-#[derive(Clone, Copy)]
-struct Slot {
-    ratio: u32,
-    gender: u8,
-    nature: u32,
-}
-
-const fn sl(ratio: u32, gender: u8, nature: u32) -> Slot {
-    Slot { ratio, gender, nature }
-}
-
-const NG: u8 = 0;
-const M: u8 = 1;
-const F: u8 = 2;
-
-// 性格: Hardy=0..Quirky=24 (C# Nature enum と同順)
-// 性別比: M7F1=0x1F, M3F1=0x3F, M1F1=0x7F, M1F3=0xBF, 性別不明=ratio不問(gender=NG)
-#[rustfmt::skip]
-const TEAMS: [[Slot; 6]; 8] = [
-    // 0: バシャーモ組
-    [sl(0x1F, M, 22), sl(0x7F, F, 21), sl(0x7F, F, 15), sl(0x7F, M, 19), sl(0xBF, M, 4), sl(0x7F, F, 4)],
-    // 1: エンテイ組
-    [sl(0, NG, 11), sl(0x7F, F, 8), sl(0x7F, M, 1), sl(0x7F, M, 16), sl(0x7F, F, 16), sl(0x7F, M, 12)],
-    // 2: ラグラージ組
-    [sl(0x1F, M, 2), sl(0x3F, F, 16), sl(0x7F, M, 15), sl(0x7F, F, 18), sl(0x7F, M, 15), sl(0x7F, F, 3)],
-    // 3: ライコウ組 (キュウコンは M1F3)
-    [sl(0, NG, 16), sl(0xBF, F, 19), sl(0x7F, F, 3), sl(0x7F, F, 22), sl(0x1F, M, 3), sl(0x7F, M, 24)],
-    // 4: メガニウム組
-    [sl(0x1F, M, 17), sl(0x1F, M, 16), sl(0x1F, M, 15), sl(0x1F, M, 19), sl(0x1F, M, 5), sl(0x7F, F, 4)],
-    // 5: スイクン組
-    [sl(0, NG, 15), sl(0x7F, F, 17), sl(0, NG, 1), sl(0x7F, M, 3), sl(0, NG, 19), sl(0x7F, F, 3)],
-    // 6: メタグロス組
-    [sl(0, NG, 1), sl(0x1F, M, 8), sl(0x3F, M, 3), sl(0x7F, F, 1), sl(0x7F, F, 3), sl(0x3F, M, 3)],
-    // 7: ヘラクロス組
-    [sl(0x7F, F, 3), sl(0x7F, M, 10), sl(0x7F, F, 15), sl(0x7F, M, 3), sl(0x7F, F, 15), sl(0x7F, M, 3)],
-];
-
-/// GCSlot.Use 相当: dummyPID(2) + IVs(2) + ability(1) + PID再抽選ループ(色回避込み)
-///
-/// 判定はブランチレスにまとめ、試行ごとの分岐を1つ(継続/採用)に抑える。
-/// 性別判定の結果はほぼ乱数なので、分岐にすると毎試行ミスプレディクトが発生する。
-#[inline(always)]
-fn gen_slot(s: &mut u32, slot: &Slot, tsv: u32) {
-    *s = s.wrapping_mul(J5.0).wrapping_add(J5.1);
-    let check_gender = slot.gender != NG;
-    let want_female = slot.gender == F;
-    loop {
-        let hi = rand(s);
-        let lo = rand(s);
-        let pid = (hi << 16) | lo;
-        let g_ok = !check_gender | (((lo & 0xFF) < slot.ratio) == want_female);
-        let n_ok = pid % 25 == slot.nature;
-        let s_ok = (hi ^ lo ^ tsv) >= 8; // 色回避
-        if g_ok & n_ok & s_ok {
-            return;
-        }
-    }
-}
-
-/// RentalTeamRank.GenerateCode 相当。code = 名前*8 + 自チーム ∈ [0,24)
-#[inline(always)]
-fn battle(s: &mut u32) -> u32 {
-    let e = (rand(s) & 7) as usize;
-    let p = loop {
-        let p = (rand(s) & 7) as usize;
-        if p != e {
-            break p;
-        }
-    };
-    let etsv = rand(s) ^ rand(s);
-    for slot in &TEAMS[e] {
-        gen_slot(s, slot, etsv);
-    }
-    let name = rand(s) % 3;
-    let ptsv = rand(s) ^ rand(s);
-    for slot in &TEAMS[p] {
-        gen_slot(s, slot, ptsv);
-    }
-    name * 8 + p as u32
-}
+use teamgen::generate_team;
 
 // ---------------------------------------------------------------------------
 
@@ -236,11 +132,11 @@ fn generate(out: &Path, do_full: bool, do_light: bool, limit: u64, threads: usiz
                     for s0 in lo..hi {
                         let s0 = s0 as u32;
                         let mut s = s0;
-                        c[0] = battle(&mut s);
-                        let v = s; // 1バトル適用後の状態 (像)
+                        c[0] = generate_team(&mut s);
+                        let v = s; // 1回のチーム生成適用後の状態 (像)
 
                         // 像を最初に確保できた場合のみ LightDB のキー計算が必要になる。
-                        // 確保できるのは全状態の約3%なので、後続バトルの計算は
+                        // 確保できるのは全状態の約3%なので、後続のチーム生成の計算は
                         // 必要になった時点まで遅延する。
                         let claimed = do_light && {
                             let idx = (v >> 6) as usize;
@@ -250,17 +146,17 @@ fn generate(out: &Path, do_full: bool, do_light: bool, limit: u64, threads: usiz
 
                         if let Some(sink) = &full_sink {
                             for k in 1..7 {
-                                c[k] = battle(&mut s);
+                                c[k] = generate_team(&mut s);
                             }
                             let file = (c[5] + c[6] * 24) as usize;
                             let key = c[4] + c[3] * 24 + c[2] * 576 + c[1] * 13824 + c[0] * 331776;
                             fbufs.push(file, (key, s0), sink);
                             if claimed {
-                                c[7] = battle(&mut s);
+                                c[7] = generate_team(&mut s);
                             }
                         } else if claimed {
                             for k in 1..8 {
-                                c[k] = battle(&mut s);
+                                c[k] = generate_team(&mut s);
                             }
                         }
 
@@ -268,7 +164,7 @@ fn generate(out: &Path, do_full: bool, do_light: bool, limit: u64, threads: usiz
                             let sink = light_sink.as_ref().unwrap();
                             let file = (c[1] + c[2] * 24) as usize;
                             let key = c[3] + c[4] * 24 + c[5] * 576 + c[6] * 13824 + c[7] * 331776;
-                            lbufs.push(file, (key, s), sink); // s = 7バトル生成後の状態
+                            lbufs.push(file, (key, s), sink); // s = 7回生成後の状態
                         }
                     }
                     let d = done.fetch_add(hi - lo, Ordering::Relaxed) + (hi - lo);
@@ -362,17 +258,17 @@ fn sort_phase(dir: &Path, keep_pairs: bool, threads: usize) {
     );
 }
 
-/// C#ライブラリとの突き合わせ用: 1バトル分の (seed, code, 生成後seed) を出力する
+/// C#ライブラリとの突き合わせ用: 1回のチーム生成の (seed, code, 生成後seed) を出力する
 fn selftest(n: u32) {
     for i in 0..n {
         let seed = i.wrapping_mul(0x9E3779B9);
         let mut s = seed;
-        let code = battle(&mut s);
+        let code = generate_team(&mut s);
         println!("{:08X} {:02} {:08X}", seed, code, s);
     }
 }
 
-/// 生成済みDBの簡易検証: キーの単調性とエントリ数を確認する
+/// 生成済みDB(576ファイル形式)の簡易検証: キーの単調性とエントリ数を確認する
 fn verify(dir: &Path, pairs: bool) {
     let mut total = 0u64;
     for i in 0..FILES {
@@ -397,8 +293,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage:
   codb-gen gen --out <DIR> [--full-only|--light-only] [--limit <N>] [--threads <N>]
+  codb-gen gen-light --out <FILE> [--limit <N>] [--threads <N>]
+  codb-gen query <FILE> (<c1..c7> | <c0..c7> | --from-seed <HEXSEED>)
   codb-gen selftest [count]
-  codb-gen verify <DIR> [--pairs]";
+  codb-gen verify <DIR> [--pairs]
+  codb-gen verify-light <FILE>
+  codb-gen convert <IN> <OUT> <cuml|cnts>";
 
     match args.get(1).map(|s| s.as_str()) {
         Some("selftest") => {
@@ -409,6 +309,56 @@ fn main() {
             let dir = args.get(2).expect(usage);
             let pairs = args.iter().any(|a| a == "--pairs");
             verify(Path::new(dir), pairs);
+        }
+        Some("verify-light") => {
+            let file = args.get(2).expect(usage);
+            clight::verify(Path::new(file));
+        }
+        Some("convert") => {
+            let input = args.get(2).expect(usage);
+            let output = args.get(3).expect(usage);
+            let target = args.get(4).expect(usage);
+            clight::convert(Path::new(input), Path::new(output), target);
+        }
+        Some("query") => {
+            let file = args.get(2).expect(usage);
+            let rest: Vec<&String> = args.iter().skip(3).collect();
+            let codes: [u32; 7] = if rest.len() == 2 && rest[0] == "--from-seed" {
+                // 既知seedから観測8回分を生成して検索する自己テスト。
+                // c0(先頭観測)は捨て、期待値(8回生成後seed)との照合まで行う。
+                let s0 = u32::from_str_radix(rest[1], 16).expect("hex seed");
+                let mut s = s0;
+                let mut cs = [0u32; 8];
+                for c in cs.iter_mut() {
+                    *c = generate_team(&mut s);
+                }
+                println!(
+                    "seed={:08X} codes={:?} expect={:08X}",
+                    s0,
+                    cs,
+                    s
+                );
+                let codes: [u32; 7] = cs[1..8].try_into().unwrap();
+                let results = clight::query(Path::new(file), &codes);
+                let hit = results.iter().any(|&(_, fin)| fin == s);
+                for (v, fin) in &results {
+                    println!("origin={:08X} result={:08X}", v, fin);
+                }
+                println!("{}", if hit { "HIT" } else { "MISS" });
+                std::process::exit(if hit { 0 } else { 1 });
+            } else {
+                // コード列指定: 7個なら c1..c7、8個なら先頭を捨てる
+                let mut cs: Vec<u32> = rest.iter().map(|s| s.parse().expect("code")).collect();
+                if cs.len() == 8 {
+                    cs.remove(0);
+                }
+                cs.as_slice().try_into().expect("need 7 or 8 codes")
+            };
+            let results = clight::query(Path::new(file), &codes);
+            for (v, fin) in &results {
+                println!("origin={:08X} result={:08X}", v, fin);
+            }
+            eprintln!("{} match(es)", results.len());
         }
         Some("gen") => {
             let mut out: Option<PathBuf> = None;
@@ -429,6 +379,22 @@ fn main() {
             }
             let out = out.expect(usage);
             generate(&out, do_full, do_light, limit, threads);
+        }
+        Some("gen-light") => {
+            let mut out: Option<PathBuf> = None;
+            let mut limit: u64 = 1 << 32;
+            let mut threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+            let mut it = args.iter().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--out" => out = Some(PathBuf::from(it.next().expect("--out FILE"))),
+                    "--limit" => limit = it.next().expect("--limit N").parse().expect("limit"),
+                    "--threads" => threads = it.next().expect("--threads N").parse().expect("threads"),
+                    _ => panic!("unknown arg: {}\n{}", a, usage),
+                }
+            }
+            let out = out.expect(usage);
+            clight::generate(&out, limit, threads);
         }
         _ => eprintln!("{}", usage),
     }

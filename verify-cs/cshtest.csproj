@@ -5,6 +5,8 @@
     <Nullable>disable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\..\cs\PokemonCoRNGLibrary\PokemonCoRNGLibrary\PokemonCoRNGLibrary.csproj" />
+    <ProjectReference Include="..\..\PokemonCoRNGLibrary\PokemonCoRNGLibrary\PokemonCoRNGLibrary.csproj" />
+    <!-- 検索処理の動作確認用に既存の検索APIを参照する -->
+    <Compile Include="..\..\PokemonCOSeedDataBaseAPI\PokemonCOSeedDataBaseAPI\*.cs" />
   </ItemGroup>
 </Project>

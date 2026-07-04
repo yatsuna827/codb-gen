@@ -1,7 +1,0 @@
-generate: states=0x1000000, threads=8, full=true, light=true
-simulation done in 259.5s
-FullDB entries : 16777216
-LightDB entries: 15528438 (0.3615% of 2^32)
-sort C:\Users\yatsu\AppData\Local\Temp\codb_smoke\FullDB done in 4.2s
-sort C:\Users\yatsu\AppData\Local\Temp\codb_smoke\LightDB done in 12.6s
-all done in 276.3s
