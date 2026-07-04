@@ -6,7 +6,9 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\PokemonCoRNGLibrary\PokemonCoRNGLibrary\PokemonCoRNGLibrary.csproj" />
-    <!-- 検索処理の動作確認用に既存の検索APIを参照する -->
-    <Compile Include="..\..\PokemonCOSeedDataBaseAPI\PokemonCOSeedDataBaseAPI\*.cs" />
+    <!-- CompressedLightDBSearcher.csが使うPlayerName/BattleTeam/GenderRatio/Gender/Nature/
+         BattleTeamUltimateの型定義のみを取り込む -->
+    <Compile Include="..\..\PokemonCOSeedDataBaseAPI\PokemonCOSeedDataBaseAPI\Enums.cs" />
+    <Compile Include="..\..\PokemonCOSeedDataBaseAPI\PokemonCOSeedDataBaseAPI\BattleTeam.cs" />
   </ItemGroup>
 </Project>

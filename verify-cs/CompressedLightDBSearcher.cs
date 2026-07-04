@@ -9,11 +9,11 @@ namespace PokemonCOSeedDataBaseAPI
 {
     /// <summary>
     /// 圧縮LightDB(単一ファイル、codb-gen/src/clight.rs参照)を検索するサンプル実装です。
-    /// 実物のFullDBSearcher/LightDBSearcher(SeedSearcher.cs)と同じ生成ロジックを使い、
+    /// 実物のSearcherと同じ生成ロジック(PokemonCoRNGLibrary)を使い、
     /// C#側から性能を検証するためのハーネス用クラスです。
     ///
-    /// 圧縮LightDBは「版数」ではなく対等な兄弟形式として**CUML(累積形式)**と**CNTS(個数形式)**の
-    /// 2種類を持つ。新ヘッダ(リトルエンディアン、両形式共通)は次の64Bです:
+    /// 圧縮LightDBは「版数」ではなく、**CUML(累積形式)**と**CNTS(個数形式)**という
+    /// 対等な2種類の形式を持ちます。新ヘッダ(リトルエンディアン、両形式共通)は次の64Bです:
     ///   +0  magic    [u8; 8] = "COLIGHT\0"
     ///   +8  format   [u8; 4] = "CUML" または "CNTS"
     ///   +12 version  u32 = 1
@@ -21,15 +21,18 @@ namespace PokemonCOSeedDataBaseAPI
     ///   +24 表セクションオフセット u64 (= 64。CUMLなら累積和表、CNTSなら個数列)
     ///   +32 部分seed配列オフセット u64
     ///   +40 checksum u64(検索では使わない)
+    ///   +48 Rice符号化パラメータk(u8、CNTSのみ使用。CUMLでは未使用)
     /// 部分seed配列(エントリ順にu16、起点seedの上位16bit)は両形式共通です。
     ///
-    /// - CUML: プレフィックスP(24^5通り)ごとのエントリ数の累積和(u32)をそのまま並べたテーブル
-    ///   (31,850,496バイト)。オープン時のロードは不要で、検索時に表を2箇所seekして
-    ///   `表[P-1]`と`表[P]`を読むだけで区間 [lo, hi) が求まる(P=0のときlo=0)。
-    /// - CNTS: プレフィックスPごとのエントリ数を6bitずつLSBファーストでビットパックした個数列
-    ///   (ちょうど5,971,968バイト)。オープン時に個数列を全ロードし、256プレフィックスごとの
-    ///   累積値アンカー(要素数⌈24^5/256⌉=31,104)を1回の走査で構築する(アンカー方式)。
-    ///   検索時はアンカーから対象Pまでの残り(最大255個)だけ個数列を加算して区間を得る。
+    /// - CUML: プレフィックスP(24^5通り)ごとのエントリ数の累積和(u32)をそのまま並べた
+    ///   テーブルです(31,850,496バイト)。オープン時のロードは不要で、検索時に表を2箇所seekして
+    ///   `表[P-1]`と`表[P]`を読むだけで区間 [lo, hi) が求まります(P=0のときlo=0)。
+    /// - CNTS: プレフィックスPごとのエントリ数countについて、残差r = count - 16をzigzagで
+    ///   非負整数化した値をパラメータkでRice符号化した列です(可変長、8B境界までゼロ詰め)。
+    ///   オープン時に個数列をすべてロードし、先頭から1回だけ線形にRice復号しながら、
+    ///   256プレフィックスごとに(累積エントリ数, 符号列中のビット位置)のチェックポイント
+    ///   (要素数⌈24^5/256⌉=31,104)を構築します。検索時はチェックポイントから対象Pまでの
+    ///   残り(最大255個)だけをブロック内復号して区間を得ます。
     ///
     /// 旧ヘッダ(version 1/2/3、magic直後がversionフィールドの形式)は非対応であり、
     /// わかりやすいエラーを投げて拒否します。
@@ -41,9 +44,9 @@ namespace PokemonCOSeedDataBaseAPI
         const long P_COUNT = 24L * 24 * 24 * 24 * 24; // 24^5 = 7,962,624
         const long HEADER_LEN = 64;
         const uint VERSION = 1;
-        const long COUNTS_BYTES = (P_COUNT * 6) / 8; // 5,971,968
         const long CUML_BYTES = P_COUNT * 4; // 31,850,496
-        const int ANCHOR_STRIDE = 256;
+        const int CHECKPOINT_STRIDE = 256;
+        const int COUNT_CENTER = 16; // 個数列の残差符号化における中心値(固定)
         static readonly byte[] MAGIC = System.Text.Encoding.ASCII.GetBytes("COLIGHT\0");
         static readonly byte[] FORMAT_CUML = System.Text.Encoding.ASCII.GetBytes("CUML");
         static readonly byte[] FORMAT_CNTS = System.Text.Encoding.ASCII.GetBytes("CNTS");
@@ -55,10 +58,14 @@ namespace PokemonCOSeedDataBaseAPI
         readonly long _offSeeds;
         readonly long _entryCount;
 
-        // CNTS専用: 個数列本体(末尾に番兵1バイトを付与したもの)。6bit値の取り出しに使う。
+        // CNTS専用: Rice符号化パラメータk。
+        readonly byte _riceK;
+        // CNTS専用: 個数列本体(セクション長そのまま、8Bパディング込み)。
         readonly byte[] _counts;
-        // CNTS専用: 256プレフィックスごとの累積エントリ数(anchor[j] = P<j*256の個数の総和)。
-        readonly uint[] _anchor;
+        // CNTS専用: 256プレフィックスごとの累積エントリ数(checkpointSum[j] = P<j*256の個数の総和)と
+        // その時点の符号列中のビット位置(checkpointBit[j])。
+        readonly uint[] _checkpointSum;
+        readonly long[] _checkpointBit;
 
         public CompressedLightDBSearcher(string path)
         {
@@ -100,45 +107,42 @@ namespace PokemonCOSeedDataBaseAPI
             _offTable = (long)_br.ReadUInt64();
             _offSeeds = (long)_br.ReadUInt64();
             _br.ReadUInt64(); // checksum(検索では使わない)
+            _riceK = _br.ReadByte(); // +48: Rice符号化パラメータk(CUMLでは未使用)
 
             if (_offTable != HEADER_LEN)
                 throw new Exception("bad table offset");
 
-            var tableBytes = _format == Format.Cuml ? CUML_BYTES : COUNTS_BYTES;
+            var tableBytes = _format == Format.Cuml ? CUML_BYTES : _offSeeds - _offTable;
             if (_offSeeds != _offTable + tableBytes)
                 throw new Exception("bad seeds offset");
 
             if (_format == Format.Cnts)
             {
-                // 個数列を一括ロード(約5.7MB)。末尾に番兵1バイトを足しておくことで、
-                // 最後のプレフィックスを読むときもbyte境界を跨ぐ2バイト読み出しが安全になる。
-                _fs.Seek(_offTable, SeekOrigin.Begin);
-                _counts = new byte[COUNTS_BYTES + 1];
-                var read = _fs.Read(_counts, 0, (int)COUNTS_BYTES);
-                if (read != COUNTS_BYTES) throw new Exception("failed to read counts section");
-                _counts[COUNTS_BYTES] = 0; // 番兵
+                if (tableBytes % 8 != 0)
+                    throw new Exception("counts section not 8B-aligned");
 
-                // アンカー構築: 全P(約800万)を1回走査し、256個ごとの累積値を記録する。
-                var anchorCount = (P_COUNT + ANCHOR_STRIDE - 1) / ANCHOR_STRIDE; // 31,104
-                _anchor = new uint[anchorCount];
+                // 個数列を一括ロード(約4MB)。
+                _fs.Seek(_offTable, SeekOrigin.Begin);
+                _counts = _br.ReadBytes((int)tableBytes);
+                if (_counts.Length != tableBytes) throw new Exception("failed to read counts section");
+
+                // チェックポイント構築: 全P(約800万)を先頭から1回線形にRice復号しながら、
+                // 256個ごとに(累積エントリ数, 符号列中のビット位置)を記録する。
+                var checkpointCount = (P_COUNT + CHECKPOINT_STRIDE - 1) / CHECKPOINT_STRIDE; // 31,104
+                _checkpointSum = new uint[checkpointCount];
+                _checkpointBit = new long[checkpointCount];
                 {
-                    ulong acc = 0;
-                    int nbits = 0;
-                    long byteIdx = 0;
+                    long bitPos = 0;
                     long sum = 0;
                     for (long p = 0; p < P_COUNT; p++)
                     {
-                        if ((p & (ANCHOR_STRIDE - 1)) == 0) _anchor[p >> 8] = (uint)sum;
-                        while (nbits < 6)
+                        if ((p & (CHECKPOINT_STRIDE - 1)) == 0)
                         {
-                            acc |= (ulong)_counts[byteIdx] << nbits;
-                            byteIdx++;
-                            nbits += 8;
+                            var idx = p >> 8;
+                            _checkpointSum[idx] = (uint)sum;
+                            _checkpointBit[idx] = bitPos;
                         }
-                        var v = (uint)(acc & 0x3F);
-                        acc >>= 6;
-                        nbits -= 6;
-                        sum += v;
+                        sum += DecodeOne(ref bitPos);
                     }
                 }
             }
@@ -149,33 +153,50 @@ namespace PokemonCOSeedDataBaseAPI
         }
 
         /// <summary>
-        /// 個数列から6bit値(プレフィックスPのエントリ数)を1件だけ取り出します。
-        /// bit=P*6として2バイトをまたいで読み、shift後に下位6bitを取り出す(番兵があるので
-        /// 末尾のPでも範囲外アクセスにならない)。
+        /// 符号列のビット位置bitPosから1件のRice符号を復号し、個数を返します。
+        /// bitPosは復号したぶんだけ前進させます(商qのunary + kbitの剰余、LSBファースト)。
         /// </summary>
-        uint GetCount(long p)
+        uint DecodeOne(ref long bitPos)
         {
-            var bit = p * 6;
-            var byteIdx = bit >> 3;
-            var shift = (int)(bit & 7);
-            var v = (uint)(_counts[byteIdx] | (_counts[byteIdx + 1] << 8)) >> shift;
-            return v & 0x3F;
+            uint q = 0;
+            while (ReadBit(ref bitPos) != 0) q++;
+
+            uint rem = 0;
+            for (int i = 0; i < _riceK; i++)
+            {
+                if (ReadBit(ref bitPos) != 0) rem |= 1u << i;
+            }
+
+            var z = (q << _riceK) | rem;
+            var r = (int)(z >> 1) ^ -(int)(z & 1); // zigzag逆変換
+            return (uint)(COUNT_CENTER + r);
+        }
+
+        uint ReadBit(ref long bitPos)
+        {
+            var byteIdx = bitPos >> 3;
+            var shift = (int)(bitPos & 7);
+            bitPos++;
+            return (uint)((_counts[byteIdx] >> shift) & 1u);
         }
 
         /// <summary>
-        /// (CNTS)プレフィックスPに対応するエントリ範囲[lo, hi)を、アンカーからの残差走査で求めます。
-        /// anchor[P>>8]がP&~0xFF(256の倍数)時点の累積値なので、そこからP-1まで加算するだけでよく、
-        /// 走査量は最大255件に収まります。
+        /// (CNTS)プレフィックスPに対応するエントリ範囲[lo, hi)を、チェックポイントからの残り復号で求めます。
+        /// checkpointSum[P&gt;&gt;8]・checkpointBit[P&gt;&gt;8]がP&amp;~0xFF(256の倍数)時点の
+        /// 累積値・ビット位置なので、そこからPまで復号するだけでよく、走査量は最大256件に収まります。
         /// </summary>
         (uint lo, uint hi) GetRangeCnts(long p)
         {
-            var anchorIdx = p >> 8;
-            var start = _anchor[anchorIdx];
-            for (var q = anchorIdx << 8; q < p; q++)
+            var checkpointIdx = p >> 8;
+            var bitPos = _checkpointBit[checkpointIdx];
+            var start = _checkpointSum[checkpointIdx];
+            var q0 = checkpointIdx << 8;
+            uint cnt = 0;
+            for (var q = q0; q <= p; q++)
             {
-                start += GetCount(q);
+                cnt = DecodeOne(ref bitPos);
+                if (q < p) start += cnt;
             }
-            var cnt = GetCount(p);
             return (start, start + cnt);
         }
 
@@ -199,7 +220,7 @@ namespace PokemonCOSeedDataBaseAPI
         /// <summary>
         /// 観測8回分の(トレーナー名, 自チーム)から起点seed候補を検索します。
         /// 先頭(観測1回目、c0)は起点seed特定には使わず、残り7回(c1..c7)で照合します。
-        /// 戻り値は現行LightDBSearcherと同じ「8回生成後(=c1..c7の7回生成後)のseed」です。
+        /// 戻り値はLightDBの意味論と同じ「8回生成後(=c1..c7の7回生成後)のseed」です。
         /// </summary>
         public IEnumerable<uint> Search((PlayerName playerNameIndex, BattleTeam teamIndex)[] keys)
         {
