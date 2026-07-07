@@ -141,6 +141,54 @@ impl RandSrc for LcgSrc {
 /// テーブル経路のバッチ再抽選候補数(調整対象。8/16/32で比較する)。
 const GEN_SLOT_TABLE_BATCH: usize = 16;
 
+/// AVX2で8候補の受理判定を行い、8bitマスク(bit i = 候補iが受理なら1)を返す。
+/// `base`は連続する16個のu16(=8個のu32ペア(hi,lo))の先頭。候補jはu32レーンw_j
+/// (リトルエンディアンで w = hi | (lo<<16))を使い、`pid = (hi<<16)|lo = rol(w,16)`。
+/// 受理条件はスカラーの`gen_slot`/自動ベクトル版と厳密に同一(pid%25はLLVMと同じ
+/// magic 0x51EB851F・>>35の逆数乗算で実装)。
+///
+/// LLVMの自動ベクトル化はbool→ビットマスクの畳み込みを約12命令の直列鎖(per-lane
+/// ビット重み+水平OR)で出すが、ここでは`vmovmskps`1命令に置き換える。畳み込みが
+/// 再抽選ループのクリティカルパス(次バッチへ進む分岐直前)にあるため効く。
+///
+/// 安全性: `base..base+16`(u16)が読み出し可能であること(呼び出し側の
+/// `start + 2*B <= mask+1`ガードが保証)。avx2はtarget-cpu=nativeで有効。
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn accept_mask8(base: *const u16, tsv: u32, ratio: u32, nature: u32, check_gender: bool, want_female: bool) -> u32 {
+    use std::arch::x86_64::*;
+    // 8個のu32レーン w = hi | (lo<<16) をロード
+    let w = _mm256_loadu_si256(base as *const __m256i);
+    let lo = _mm256_srli_epi32(w, 16);
+    let hi = _mm256_and_si256(w, _mm256_set1_epi32(0xFFFF));
+    let pid = _mm256_or_si256(_mm256_slli_epi32(hi, 16), lo);
+    // pid % 25 = pid - (mulhi(pid, magic) >> 3) * 25   (magic=ceil(2^35/25)=0x51EB851F)
+    let magic = _mm256_set1_epi32(0x51EB851Fu32 as i32);
+    let prod_e = _mm256_mul_epu32(pid, magic); // 偶レーン(0,2,4,6)の64bit積
+    let prod_o = _mm256_mul_epu32(_mm256_srli_epi64(pid, 32), magic); // 奇レーン(1,3,5,7)
+    // 各積の上位dword(=mulhi)を集める: prod_eの上位は偶dword位置へ、prod_oの上位は奇dword位置へ
+    let mulhi = _mm256_or_si256(
+        _mm256_srli_epi64(prod_e, 32),
+        _mm256_slli_epi64(_mm256_srli_epi64(prod_o, 32), 32),
+    );
+    let q = _mm256_srli_epi32(mulhi, 3);
+    let r = _mm256_sub_epi32(pid, _mm256_mullo_epi32(q, _mm256_set1_epi32(25)));
+    let n_ok = _mm256_cmpeq_epi32(r, _mm256_set1_epi32(nature as i32));
+    // 色回避: (hi ^ lo ^ tsv) >= 8。値は<2^16なので符号付きcmpgt(x,7)で可。
+    let x = _mm256_xor_si256(_mm256_xor_si256(hi, lo), _mm256_set1_epi32(tsv as i32));
+    let s_ok = _mm256_cmpgt_epi32(x, _mm256_set1_epi32(7));
+    let mut accept = _mm256_and_si256(n_ok, s_ok);
+    if check_gender {
+        // ((lo & 0xFF) < ratio) == want_female。lo&0xFF<256, ratio<256なので符号付きcmpgtで可。
+        let lob = _mm256_and_si256(lo, _mm256_set1_epi32(0xFF));
+        let g_lt = _mm256_cmpgt_epi32(_mm256_set1_epi32(ratio as i32), lob); // ratio > lob ⇔ lob < ratio
+        let g_ok = if want_female { g_lt } else { _mm256_andnot_si256(g_lt, _mm256_set1_epi32(-1)) };
+        accept = _mm256_and_si256(accept, g_ok);
+    }
+    // 各レーンの符号bit(受理なら1)を8bitに畳む。bit i = レーンi。
+    _mm256_movemask_ps(_mm256_castsi256_ps(accept)) as u32
+}
+
 /// テーブル経路専用のスロット再抽選。汎用gen_slotと同一の受理条件を、
 /// 連続スライス上のバッチ走査で評価する(自動ベクトル化とブランチ削減狙い)。
 /// idxは読み進めた位置を反映して更新する。戻り値はSome(消費rand数。skip5の5を含む)。
@@ -164,18 +212,32 @@ fn gen_slot_table(table: &[u16], mask: usize, idx: &mut usize, idx_limit: usize,
         }
         let start = (base + 1) & mask;
         if start + 2 * B <= mask + 1 {
-            // 連続ウィンドウ(ラップなし)。win[2j]がhiの取得元、win[2j+1]がloの取得元
-            let win = unsafe { table.get_unchecked(start..start + 2 * B) };
-            let mut hits: u32 = 0;
-            for j in 0..B {
-                let hi = unsafe { *win.get_unchecked(2 * j) } as u32;
-                let lo = unsafe { *win.get_unchecked(2 * j + 1) } as u32;
-                let pid = (hi << 16) | lo;
-                let g_ok = !check_gender | (((lo & 0xFF) < slot.ratio) == want_female);
-                let n_ok = pid % 25 == slot.nature;
-                let s_ok = (hi ^ lo ^ tsv) >= 8;
-                hits |= ((g_ok & n_ok & s_ok) as u32) << j;
-            }
+            // 連続ウィンドウ(ラップなし)。候補jはu16ペア(start+2j, start+2j+1)=(hi,lo)。
+            // 受理判定をB=16候補ぶんまとめてビットマスクhitsに畳む。
+            // AVX2版はvmovmskps畳み込みで直列レイテンシを削る(accept_mask8参照)。
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            let hits: u32 = {
+                debug_assert!(B == 16);
+                let p = unsafe { table.as_ptr().add(start) };
+                let m0 = unsafe { accept_mask8(p, tsv, slot.ratio, slot.nature, check_gender, want_female) };
+                let m1 = unsafe { accept_mask8(p.add(16), tsv, slot.ratio, slot.nature, check_gender, want_female) };
+                m0 | (m1 << 8)
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            let hits: u32 = {
+                let win = unsafe { table.get_unchecked(start..start + 2 * B) };
+                let mut hits: u32 = 0;
+                for j in 0..B {
+                    let hi = unsafe { *win.get_unchecked(2 * j) } as u32;
+                    let lo = unsafe { *win.get_unchecked(2 * j + 1) } as u32;
+                    let pid = (hi << 16) | lo;
+                    let g_ok = !check_gender | (((lo & 0xFF) < slot.ratio) == want_female);
+                    let n_ok = pid % 25 == slot.nature;
+                    let s_ok = (hi ^ lo ^ tsv) >= 8;
+                    hits |= ((g_ok & n_ok & s_ok) as u32) << j;
+                }
+                hits
+            };
             // 高速パス: バッチ全体(base+1..base+2B)が書き込み済み範囲に収まるなら、
             // 全レーンが信用でき境界マスクは不要。fallback率0%の設定ではこちらがほぼ常に通り、
             // 減算・除算・マスク生成をクリティカルパス(バッチ間の直列レイテンシ鎖)から外す。

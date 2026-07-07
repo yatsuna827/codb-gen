@@ -261,7 +261,13 @@ const PROLOGUE: i64 = 1 << 16;
 const LEAD: i64 = 1 << 14;
 
 /// リングバッファ本体(SoA)。論理位置pのスロットにコードc(u8)・消費数n(u16)・
-/// 状態s(u32、その位置での軌道の状態そのもの)・像フラグを持つ。
+/// 乱数値hi(u16、その位置での軌道の状態の上位16bit)・像フラグを持つ。
+///
+/// 状態s(u32)そのものは配列に持たない。チーム生成が読むのは上位16bitのhiだけであり、
+/// 起点seed(像の解決に必要)は`p-LAG`を追うカーソル`resolve_s`で、最終seedは
+/// `lcg_jump(起点seed, ホップ距離)`で必要時にだけ算出する(scan_arc参照)。これにより
+/// fillの書き込みが位置あたり6バイト(u32+u16)→2バイト(u16のみ)になり、u32配列
+/// (RINGぶんで1MB)のキャッシュ圧も消える。
 ///
 /// スロット再利用の安全性: 物理スロット(p & (RING-1))は論理位置
 /// p, p+RING, p+2*RING, ... で使い回される。以下の順序が常に成り立つように
@@ -274,18 +280,13 @@ const LEAD: i64 = 1 << 14;
 /// したがって新しい論理位置pのためのフラグ書き込みは、必ず前の使用者(p-RING)の
 /// クリアより後に起こり、フラグが混線することはない。
 ///
-/// s配列のみ、位置p+LEADへの先行書き込みで論理位置p+LEAD-RING(= p-(RING-LEAD))の
-/// sを上書きする。しかし解決時のホップ参照が読むsは[p-LAG, p]の範囲に限られ、
+/// hi配列のみ、位置p+LEADへの先行書き込みで論理位置p+LEAD-RING(= p-(RING-LEAD))の
+/// hiを上書きする。しかし生成が読むhiは[p, p+LEAD]の範囲に限られ、
 /// LEAD < RING-LAG(= 2^17)である限りp+LEAD-RING < p-LAGなので混線しない
-/// (生きているsの範囲は[p+LEAD-RING, p+LEAD]で、LEADを小さくするほど安全側)。
-/// hiは各スロットのsの上位16bit(=その位置での乱数出力)を別配列で持ったもの。
-/// チーム生成(generate_team_from_table)はこのhiだけを読む。u32のsではなくu16の
-/// hiを読むことで、ホットループの読み込みウィンドウ(約LEAD要素)が半分のバイト数に
-/// なりL1Dに収まりやすくなる(帯域も半減する)。sとhiは常に同じ位置で同時に書き込む。
+/// (生きているhiの範囲は[p+LEAD-RING, p+LEAD]で、LEADを小さくするほど安全側)。
 struct Ring {
     c: Vec<u8>,
     n: Vec<u16>,
-    s: Vec<u32>,
     hi: Vec<u16>,
     img: Vec<bool>,
 }
@@ -295,7 +296,6 @@ impl Ring {
         Self {
             c: vec![0u8; RING],
             n: vec![0u16; RING],
-            s: vec![0u32; RING],
             hi: vec![0u16; RING],
             img: vec![false; RING],
         }
@@ -307,30 +307,35 @@ impl Ring {
     }
 }
 
-/// 位置startからリングバッファ内を7ホップ(start→start+n→…)辿り、
+/// 位置start(起点状態origin)からリングバッファ内を7ホップ(start→start+n→…)辿り、
 /// キーK(7個のコードを24進数として結合した値)と7回チーム生成後のseedを合成する。
+/// 最終seedは、ホップで得た総距離(= start→最終位置の位置差 = 消費数nの総和)を使って
+/// `lcg_jump(origin, 距離)`で算出する(状態列を配列で持たないため)。
 /// ホップ先がscanned_upto(この時点で走査済みの末尾位置)を超える場合は、
-/// startの状態s_startから素直にチーム生成を7回呼び直すフォールバックで解決する
+/// originから素直にチーム生成を7回呼び直すフォールバックで解決する
 /// (平均ホップ距離は約8,850でLAGに対し十分小さいため、実質発生しない)。
-fn hop_key(ring: &Ring, start: i64, scanned_upto: i64) -> (u64, u32) {
+fn hop_key(ring: &Ring, start: i64, origin: u32, scanned_upto: i64) -> (u64, u32) {
     let mut pos = start;
     let mut k: u64 = 0;
     for _ in 0..7 {
         if pos > scanned_upto {
-            return hop_key_fallback(ring, start);
+            return hop_key_fallback(origin);
         }
         let slot = Ring::idx(pos);
         k = k * 24 + ring.c[slot] as u64;
         pos += ring.n[slot] as i64;
     }
     if pos > scanned_upto {
-        return hop_key_fallback(ring, start);
+        return hop_key_fallback(origin);
     }
-    (k, ring.s[Ring::idx(pos)])
+    // 最終位置の状態 = 起点originを(pos - start)ステップ進めた状態。
+    // これは旧実装の ring.s[Ring::idx(pos)](= lcg_jump(0, pos)) と厳密に一致する。
+    let final_seed = teamgen::lcg_jump(origin, (pos - start) as u32);
+    (k, final_seed)
 }
 
-fn hop_key_fallback(ring: &Ring, start: i64) -> (u64, u32) {
-    let mut s = ring.s[Ring::idx(start)];
+fn hop_key_fallback(origin: u32) -> (u64, u32) {
+    let mut s = origin;
     let mut k: u64 = 0;
     for _ in 0..7 {
         k = k * 24 + generate_team(&mut s) as u64;
@@ -356,35 +361,37 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
     let mut cur_s = teamgen::lcg_jump(0, start_off);
     let mut ring = Ring::new();
 
-    // 状態列の先行書き込み: 生成位置が位置pにいるとき、ring.sは位置p+LEADまで
-    // 書き込み済みであるようにする(チーム生成はring.s読みのテーブル駆動で行うため)。
+    // 解決カーソル: resolve_sは常に「位置p-LAGの状態」を保持する(像の起点seed origin)。
+    // 初期状態は位置(scan_start-LAG)の状態で、ループ末尾で1ステップずつ進める。
+    let resolve_off = (scan_start - LAG).rem_euclid(1i64 << 32) as u32;
+    let mut resolve_s = teamgen::lcg_jump(0, resolve_off);
+
+    // 乱数値列の先行書き込み: 生成位置が位置pにいるとき、ring.hiは位置p+LEADまで
+    // 書き込み済みであるようにする(チーム生成はring.hi読みのテーブル駆動で行うため)。
     // まず[scan_start, scan_start+LEAD)を埋め、以降はループ内で1位置ずつ先へ埋める。
     for q in scan_start..scan_start + LEAD {
-        let slot = Ring::idx(q);
-        ring.s[slot] = cur_s;
-        ring.hi[slot] = (cur_s >> 16) as u16;
+        ring.hi[Ring::idx(q)] = (cur_s >> 16) as u16;
         cur_s = teamgen::step(cur_s);
     }
 
     for p in scan_start..scan_end {
-        // 位置p+LEADの状態を書き込む(cur_sは常に書き込み位置の状態)
-        let wslot = Ring::idx(p + LEAD);
-        ring.s[wslot] = cur_s;
-        ring.hi[wslot] = (cur_s >> 16) as u16;
+        // 位置p+LEADの乱数値を書き込む(cur_sは常に書き込み位置p+LEADの状態)
+        ring.hi[Ring::idx(p + LEAD)] = (cur_s >> 16) as u16;
         cur_s = teamgen::step(cur_s);
 
         let slot = Ring::idx(p);
-        let s_here = ring.s[slot];
 
-        // 生成位置: 位置pで1回だけチーム生成する。乱数値は書き込み済みのring.sから
+        // 生成位置: 位置pで1回だけチーム生成する。乱数値は書き込み済みのring.hiから
         // テーブル駆動で読むため、LCGの逐次乗算チェーンを含まない。
         // LEADを追い越す(n>LEAD)稀な位置ではNoneが返るので、その位置だけ
-        // スカラー(逐次LCG)で再計算する。
+        // スカラー(逐次LCG)で再計算する。位置pの状態はring.sを持たないため
+        // lcg_jump(resolve_s, LAG)(= 位置p-LAGの状態をLAGステップ進めた状態)で得る
+        // (fallbackほぼ0%・assert失敗0のcold pathのみで評価される)。
         let (code, n) = match teamgen::generate_team_from_table(&ring.hi, slot, RING - 1, LEAD as usize) {
             Some(r) => r,
             None => {
                 local_fallbacks += 1;
-                let mut s = s_here;
+                let mut s = teamgen::lcg_jump(resolve_s, LAG as u32);
                 teamgen::generate_team_with_count(&mut s)
             }
         };
@@ -392,22 +399,22 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
             n <= u16::MAX as u32,
             "team generation consumed {} rand calls (> u16::MAX) at s=0x{:08X}",
             n,
-            s_here
+            teamgen::lcg_jump(resolve_s, LAG as u32)
         );
         ring.c[slot] = code as u8;
         ring.n[slot] = n as u16;
-        // 像フラグを位置p+nのスロットに立てる(そのスロットのc/n/sは未書き込みのまま)
+        // 像フラグを位置p+nのスロットに立てる(そのスロットのc/nは未書き込みのまま)
         ring.img[Ring::idx(p + n as i64)] = true;
 
-        // 位置p-LAGを解決する
+        // 位置p-LAGを解決する(resolve_sがその状態)
         let resolve_p = p - LAG;
         if resolve_p >= scan_start {
             let rslot = Ring::idx(resolve_p);
             let is_image = ring.img[rslot];
             ring.img[rslot] = false; // その場でクリアし、スロット再利用に備える
             if is_image {
-                let origin = ring.s[rslot];
-                let (k, final_seed) = hop_key(&ring, resolve_p, p);
+                let origin = resolve_s;
+                let (k, final_seed) = hop_key(&ring, resolve_p, origin, p);
 
                 // オンライン自己検査: 全周期で約100万サンプル、決定的、常時有効
                 if origin & 0xFFF == 0 {
@@ -434,6 +441,9 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
                 }
             }
         }
+
+        // 解決カーソルを次の位置(p+1)の p+1-LAG へ進める。
+        resolve_s = teamgen::step(resolve_s);
     }
 
     self_checks.fetch_add(local_checks, Ordering::Relaxed);
