@@ -9,7 +9,10 @@
 //! 圧縮LightDB(単一ファイル、gen-light / query / verify-light / convert): src/clight.rs参照。
 
 mod clight;
+mod lcg;
+mod teamdef;
 mod teamgen;
+mod teamgen_optimized;
 
 use std::path::{Path, PathBuf};
 

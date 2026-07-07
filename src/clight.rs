@@ -1,49 +1,5 @@
-//! LightDB圧縮フォーマット(単一ファイル)。仕様はdocs/design-compressed-lightdb.mdを参照。
-//! 外部ドキュメントに書いてある内容をここに重複して書く必要はない。
-//!
-//! キー: 観測1〜7回目のチーム生成コード c1..c7(各 [0,24))に対し
-//!   K = c1*(24^6) + c2*(24^5) + ... + c7 (< 24^7、33bit)
-//! また、前の5回分だけを取り出した値PをPrefixと呼ぶ(24進数と見れば、前から5文字であるため)。
-//!   P = c1*(24^4) + c2*(24^3) + c3*(24^2) + c4*24 + c5
-//!
-//! 圧縮LightDBはCUML(累積和形式)とCNTS(個数形式)の2種類ある。
-//!   - CUML: Prefix P(24^5通り)ごとのエントリ数の累積和(u32)をそのまま並べたテーブル。
-//!     オープン時のロードが不要で、検索は表を2箇所seekするだけで完結する(表は31.85MB)。
-//!   - CNTS: Prefix Pごとのエントリ数を、中心値16からの残差のzigzag+Rice符号で
-//!     エンコードした個数列。ファイルサイズが最小になる代わりに、オープン時に個数列を
-//!     ロードし検索のたびに先頭からの復号(累積和相当)を構築する必要がある(表は約4MB)。
-//!
-//! ファイルレイアウト(すべてリトルエンディアン、両形式共通):
-//!   offset 0: ヘッダ64B
-//!     +0  magic    [u8; 8] = "COLIGHT\0" (ファミリー識別、両形式で不変)
-//!     +8  format   [u8; 4] = "CUML" または "CNTS" (FourCC、ASCII)
-//!     +12 version  u32 = 1 (形式ごとに1から振り直す)
-//!     +16 entry_count u64
-//!     +24 表セクションオフセットu64 (= 64。CUMLなら累積和表、CNTSなら個数列)
-//!     +32 部分seed配列オフセットu64
-//!         (CUML: 64 + 24^5*4 = 31,850,560)
-//!         (CNTS: 64 + 個数列セクション長(可変、8Bアラインされる))
-//!     +40 checksum u64 (表セクション+部分seed配列のFNV-1a 64、この順)
-//!     +48 Rice符号化パラメータk (u8)。CNTSのみ使用、生成時にファイル全体が
-//!         最小になる値を選んで記録する(CUMLでは未使用、0のまま)
-//!     +49〜63 (予約) = 0
-//!   表セクション:
-//!     CUML: Prefix P(24^5通り)ごとのエントリ数の累積和を先頭からu32(LE)で並べたテーブル。
-//!           要素iの値は「P<=iであるエントリ数の総和」。
-//!     CNTS: Prefix Pごとのエントリ数countについて、残差r = count - 16をzigzagで非負整数化した
-//!           z = (r << 1) ^ (r >> 31)を、パラメータkでRice符号化(商z>>kを「1がq個+0」の
-//!           unary、剰余の下位kbitをLSBファースト)した列を先頭から並べる。ビット列は
-//!           LSBファーストでバイト詰めし、末尾は8B境界までゼロ詰めする。
-//!   部分seed配列:エントリのK昇順に、観測1回目開始時点のseedの上位16bitを並べたテーブル
-//!     (両形式共通)。
-//!
-//! キーはエントリのソートに使う。c1..c5から計算されるPrefixは表セクションに反映されるが
-//! (値そのものはファイルに保存されない)、c6・c7はソートにのみ使われる。
-//! 検索は、CUMLなら表を2箇所seekして区間[lo, hi)を直接得る。CNTSなら個数列をロードし
-//! 先頭からPまでをRice復号しながら和を取ることで区間開始を求め、区間終了は開始+個数[P]で得る。
-//! 区間内(平均16.1エントリ)の全エントリについて部分seedの下位16bitを全探索し、7回分のコードを
-//! 入力値と照合(`generate_team_checked`)して、完全一致するものだけを返す。
-//!
+//! LightDB圧縮フォーマット(単一ファイル)。
+//! 詳細な仕様は docs/design-compressed-lightdb.md を参照。
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -51,7 +7,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::teamgen::{self, generate_team, generate_team_checked};
+use crate::lcg;
+use crate::teamgen::{generate_team, generate_team_checked, generate_team_with_count};
+use crate::teamgen_optimized;
 
 pub const MAGIC: [u8; 8] = *b"COLIGHT\0";
 const FORMAT_CUML: [u8; 4] = *b"CUML";
@@ -254,7 +212,7 @@ const PROLOGUE: i64 = 1 << 16;
 /// 状態列(ring.s)の書き込みを生成位置より先行させる位置数。
 /// 平均消費数n(約1,265)に対して十分小さく取れば、fill(write)と生成(read)が時間的に
 /// 近接しキャッシュヒットしやすくなる。ただしn>LEADの位置は生成が書き込み位置を追い越して
-/// 古いデータを読むため、`teamgen::generate_team_from_table`がNoneを返し、その位置だけ
+/// 古いデータを読むため、`teamgen_optimized::generate_team_from_table`がNoneを返し、その位置だけ
 /// スカラー(`generate_team_with_count`)で再計算する(フォールバック)。
 /// 安全性は`LEAD < RING-LAG`(= 2^17)にのみ依存し、小さくするほど安全側(詳細はRing構造体の
 /// ドキュメントコメントおよびdocs/design-orbit-scan.md参照)。
@@ -330,7 +288,7 @@ fn hop_key(ring: &Ring, start: i64, origin: u32, scanned_upto: i64) -> (u64, u32
     }
     // 最終位置の状態 = 起点originを(pos - start)ステップ進めた状態。
     // これは旧実装の ring.s[Ring::idx(pos)](= lcg_jump(0, pos)) と厳密に一致する。
-    let final_seed = teamgen::lcg_jump(origin, (pos - start) as u32);
+    let final_seed = lcg::lcg_jump(origin, (pos - start) as u32);
     (k, final_seed)
 }
 
@@ -358,26 +316,26 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
 
     // 弧の起点状態は、軌道の起点(seed 0)からのLCGジャンプで直接求める。
     let start_off = scan_start.rem_euclid(1i64 << 32) as u32;
-    let mut cur_s = teamgen::lcg_jump(0, start_off);
+    let mut cur_s = lcg::lcg_jump(0, start_off);
     let mut ring = Ring::new();
 
     // 解決カーソル: resolve_sは常に「位置p-LAGの状態」を保持する(像の起点seed origin)。
     // 初期状態は位置(scan_start-LAG)の状態で、ループ末尾で1ステップずつ進める。
     let resolve_off = (scan_start - LAG).rem_euclid(1i64 << 32) as u32;
-    let mut resolve_s = teamgen::lcg_jump(0, resolve_off);
+    let mut resolve_s = lcg::lcg_jump(0, resolve_off);
 
     // 乱数値列の先行書き込み: 生成位置が位置pにいるとき、ring.hiは位置p+LEADまで
     // 書き込み済みであるようにする(チーム生成はring.hi読みのテーブル駆動で行うため)。
     // まず[scan_start, scan_start+LEAD)を埋め、以降はループ内で1位置ずつ先へ埋める。
     for q in scan_start..scan_start + LEAD {
         ring.hi[Ring::idx(q)] = (cur_s >> 16) as u16;
-        cur_s = teamgen::step(cur_s);
+        cur_s = lcg::adv(cur_s);
     }
 
     for p in scan_start..scan_end {
         // 位置p+LEADの乱数値を書き込む(cur_sは常に書き込み位置p+LEADの状態)
         ring.hi[Ring::idx(p + LEAD)] = (cur_s >> 16) as u16;
-        cur_s = teamgen::step(cur_s);
+        cur_s = lcg::adv(cur_s);
 
         let slot = Ring::idx(p);
 
@@ -387,19 +345,19 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
         // スカラー(逐次LCG)で再計算する。位置pの状態はring.sを持たないため
         // lcg_jump(resolve_s, LAG)(= 位置p-LAGの状態をLAGステップ進めた状態)で得る
         // (fallbackほぼ0%・assert失敗0のcold pathのみで評価される)。
-        let (code, n) = match teamgen::generate_team_from_table(&ring.hi, slot, RING - 1, LEAD as usize) {
+        let (code, n) = match teamgen_optimized::generate_team_from_table(&ring.hi, slot, RING - 1, LEAD as usize) {
             Some(r) => r,
             None => {
                 local_fallbacks += 1;
-                let mut s = teamgen::lcg_jump(resolve_s, LAG as u32);
-                teamgen::generate_team_with_count(&mut s)
+                let mut s = lcg::lcg_jump(resolve_s, LAG as u32);
+                generate_team_with_count(&mut s)
             }
         };
         assert!(
             n <= u16::MAX as u32,
             "team generation consumed {} rand calls (> u16::MAX) at s=0x{:08X}",
             n,
-            teamgen::lcg_jump(resolve_s, LAG as u32)
+            lcg::lcg_jump(resolve_s, LAG as u32)
         );
         ring.c[slot] = code as u8;
         ring.n[slot] = n as u16;
@@ -443,7 +401,7 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
         }
 
         // 解決カーソルを次の位置(p+1)の p+1-LAG へ進める。
-        resolve_s = teamgen::step(resolve_s);
+        resolve_s = lcg::adv(resolve_s);
     }
 
     self_checks.fetch_add(local_checks, Ordering::Relaxed);
