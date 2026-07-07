@@ -176,21 +176,30 @@ fn gen_slot_table(table: &[u16], mask: usize, idx: &mut usize, idx_limit: usize,
                 let s_ok = (hi ^ lo ^ tsv) >= 8;
                 hits |= ((g_ok & n_ok & s_ok) as u32) << j;
             }
-            // 書き込み済み範囲で完全に読めるレーン数だけを信用する(それ以降は古い値かもしれない)
-            let valid = ((idx_limit - base) / 2).min(B);
-            let valid_mask = if valid >= 32 { u32::MAX } else { (1u32 << valid) - 1 };
-            let vhits = hits & valid_mask;
-            if vhits != 0 {
-                let j = vhits.trailing_zeros() as usize; // 書き込み済み範囲で最初の受理候補
-                *idx += 2 * (j + 1);
-                return Some(n + 2 * (j as u32 + 1));
-            }
-            if valid < B {
+            // 高速パス: バッチ全体(base+1..base+2B)が書き込み済み範囲に収まるなら、
+            // 全レーンが信用でき境界マスクは不要。fallback率0%の設定ではこちらがほぼ常に通り、
+            // 減算・除算・マスク生成をクリティカルパス(バッチ間の直列レイテンシ鎖)から外す。
+            if base + 2 * B <= idx_limit {
+                if hits != 0 {
+                    let j = hits.trailing_zeros() as usize;
+                    *idx += 2 * (j + 1);
+                    return Some(n + 2 * (j as u32 + 1));
+                }
+                *idx += 2 * B;
+                n += 2 * B as u32;
+            } else {
+                // 書き込み位置近傍: 完全に読めるレーン数だけを信用する(それ以降は古い値かもしれない)
+                let valid = ((idx_limit - base) / 2).min(B);
+                let valid_mask = if valid >= 32 { u32::MAX } else { (1u32 << valid) - 1 };
+                let vhits = hits & valid_mask;
+                if vhits != 0 {
+                    let j = vhits.trailing_zeros() as usize; // 書き込み済み範囲で最初の受理候補
+                    *idx += 2 * (j + 1);
+                    return Some(n + 2 * (j as u32 + 1));
+                }
                 // このバッチで書き込み位置に到達したが受理なし: スカラー再計算へ
                 return None;
             }
-            *idx += 2 * B;
-            n += 2 * B as u32;
         } else {
             // 境界跨ぎ: 1候補ずつスカラーで(ラップを&maskで処理)
             let hi = unsafe { *table.get_unchecked((base + 1) & mask) } as u32;
