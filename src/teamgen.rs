@@ -150,7 +150,7 @@ const GEN_SLOT_TABLE_BATCH: usize = 16;
 /// 呼び出し側にスカラー再計算へフォールバックさせる。書き込み済み範囲内で受理が確定した場合の
 /// 挙動(受理順位・n・idxの最終値)は先行書き込みが無い場合と完全に同一。
 #[inline(always)]
-fn gen_slot_table(table: &[u32], mask: usize, idx: &mut usize, idx_limit: usize, slot: &Slot, tsv: u32) -> Option<u32> {
+fn gen_slot_table(table: &[u16], mask: usize, idx: &mut usize, idx_limit: usize, slot: &Slot, tsv: u32) -> Option<u32> {
     *idx += 5;
     let mut n = 5u32;
     let check_gender = slot.gender != NG;
@@ -168,8 +168,8 @@ fn gen_slot_table(table: &[u32], mask: usize, idx: &mut usize, idx_limit: usize,
             let win = unsafe { table.get_unchecked(start..start + 2 * B) };
             let mut hits: u32 = 0;
             for j in 0..B {
-                let hi = unsafe { *win.get_unchecked(2 * j) } >> 16;
-                let lo = unsafe { *win.get_unchecked(2 * j + 1) } >> 16;
+                let hi = unsafe { *win.get_unchecked(2 * j) } as u32;
+                let lo = unsafe { *win.get_unchecked(2 * j + 1) } as u32;
                 let pid = (hi << 16) | lo;
                 let g_ok = !check_gender | (((lo & 0xFF) < slot.ratio) == want_female);
                 let n_ok = pid % 25 == slot.nature;
@@ -193,8 +193,8 @@ fn gen_slot_table(table: &[u32], mask: usize, idx: &mut usize, idx_limit: usize,
             n += 2 * B as u32;
         } else {
             // 境界跨ぎ: 1候補ずつスカラーで(ラップを&maskで処理)
-            let hi = unsafe { *table.get_unchecked((base + 1) & mask) } >> 16;
-            let lo = unsafe { *table.get_unchecked((base + 2) & mask) } >> 16;
+            let hi = unsafe { *table.get_unchecked((base + 1) & mask) } as u32;
+            let lo = unsafe { *table.get_unchecked((base + 2) & mask) } as u32;
             *idx += 2;
             n += 2;
             let pid = (hi << 16) | lo;
@@ -291,15 +291,17 @@ pub fn generate_team_with_count(s: &mut u32) -> (u32, u32) {
 }
 
 /// generate_team_from_table専用のテーブル読み。next_tab(table, mask, &mut idx)は
-/// TableSrc::next16と同一の意味(idxを1進めてtable[idx&mask]の上位16bitを返す)。
+/// TableSrc::next16と同一の意味(idxを1進めてtable[idx&mask]の乱数値(上位16bit)を返す)。
+/// tableは各要素が既に状態の上位16bitである`&[u16]`(clight側のring.hi)。
 #[inline(always)]
-fn next_tab(table: &[u32], mask: usize, idx: &mut usize) -> u32 {
+fn next_tab(table: &[u16], mask: usize, idx: &mut usize) -> u32 {
     *idx += 1;
-    (unsafe { *table.get_unchecked(*idx & mask) }) >> 16
+    (unsafe { *table.get_unchecked(*idx & mask) }) as u32
 }
 
-/// 事前計算済みの状態列(リングバッファ)から乱数値を読んで1回分のチーム生成を行う。
-/// table[(start_idx + i) & mask] が起点のiステップ先の状態であること、および
+/// 事前計算済みの乱数値列(リングバッファ)から乱数値を読んで1回分のチーム生成を行う。
+/// tableは各要素が状態の上位16bit(=その位置での乱数出力)である`&[u16]`。
+/// table[(start_idx + i) & mask] が起点のiステップ先の乱数値であること、および
 /// 呼び出し側の書き込み位置が論理位置`start_idx + lead`まで進んでいることを前提とする。
 /// 戻り値は`Some((コード, 消費したrand呼び出し回数))`。消費数nがleadを超える(=書き込み位置を
 /// 追い越して古いデータを読むことになる)場合は`None`を返すので、呼び出し側はスカラー
@@ -310,7 +312,7 @@ fn next_tab(table: &[u32], mask: usize, idx: &mut usize) -> u32 {
 /// (これらの読み出しはidxが数十しか進まないため、lead>=2048程度であれば書き込み位置越えは
 /// 事実上発生せず、チェックを省略している)。
 #[inline(always)]
-pub fn generate_team_from_table(table: &[u32], start_idx: usize, mask: usize, lead: usize) -> Option<(u32, u32)> {
+pub fn generate_team_from_table(table: &[u16], start_idx: usize, mask: usize, lead: usize) -> Option<(u32, u32)> {
     debug_assert!(mask < table.len());
     let idx_limit = start_idx + lead;
     let mut idx = start_idx;
@@ -475,12 +477,14 @@ mod tests {
             for j in 1..LEN {
                 states[j] = step(states[j - 1]);
             }
+            // テーブル経路は上位16bitのみを読む(clight側のring.hiに相当)。
+            let hi: Vec<u16> = states.iter().map(|&s| (s >> 16) as u16).collect();
 
             let mut s = seed;
             let (c, n) = generate_team_with_count(&mut s);
             let final_s = s;
 
-            match generate_team_from_table(&states, 0, MASK, LEN) {
+            match generate_team_from_table(&hi, 0, MASK, LEN) {
                 None => {
                     // n >= LEN。事実上起きないはずだが、起きてもスキップして継続する。
                     skip_count += 1;

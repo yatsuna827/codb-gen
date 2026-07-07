@@ -278,16 +278,27 @@ const LEAD: i64 = 1 << 14;
 /// sを上書きする。しかし解決時のホップ参照が読むsは[p-LAG, p]の範囲に限られ、
 /// LEAD < RING-LAG(= 2^17)である限りp+LEAD-RING < p-LAGなので混線しない
 /// (生きているsの範囲は[p+LEAD-RING, p+LEAD]で、LEADを小さくするほど安全側)。
+/// hiは各スロットのsの上位16bit(=その位置での乱数出力)を別配列で持ったもの。
+/// チーム生成(generate_team_from_table)はこのhiだけを読む。u32のsではなくu16の
+/// hiを読むことで、ホットループの読み込みウィンドウ(約LEAD要素)が半分のバイト数に
+/// なりL1Dに収まりやすくなる(帯域も半減する)。sとhiは常に同じ位置で同時に書き込む。
 struct Ring {
     c: Vec<u8>,
     n: Vec<u16>,
     s: Vec<u32>,
+    hi: Vec<u16>,
     img: Vec<bool>,
 }
 
 impl Ring {
     fn new() -> Self {
-        Self { c: vec![0u8; RING], n: vec![0u16; RING], s: vec![0u32; RING], img: vec![false; RING] }
+        Self {
+            c: vec![0u8; RING],
+            n: vec![0u16; RING],
+            s: vec![0u32; RING],
+            hi: vec![0u16; RING],
+            img: vec![false; RING],
+        }
     }
 
     #[inline(always)]
@@ -349,13 +360,17 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
     // 書き込み済みであるようにする(チーム生成はring.s読みのテーブル駆動で行うため)。
     // まず[scan_start, scan_start+LEAD)を埋め、以降はループ内で1位置ずつ先へ埋める。
     for q in scan_start..scan_start + LEAD {
-        ring.s[Ring::idx(q)] = cur_s;
+        let slot = Ring::idx(q);
+        ring.s[slot] = cur_s;
+        ring.hi[slot] = (cur_s >> 16) as u16;
         cur_s = teamgen::step(cur_s);
     }
 
     for p in scan_start..scan_end {
         // 位置p+LEADの状態を書き込む(cur_sは常に書き込み位置の状態)
-        ring.s[Ring::idx(p + LEAD)] = cur_s;
+        let wslot = Ring::idx(p + LEAD);
+        ring.s[wslot] = cur_s;
+        ring.hi[wslot] = (cur_s >> 16) as u16;
         cur_s = teamgen::step(cur_s);
 
         let slot = Ring::idx(p);
@@ -365,7 +380,7 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
         // テーブル駆動で読むため、LCGの逐次乗算チェーンを含まない。
         // LEADを追い越す(n>LEAD)稀な位置ではNoneが返るので、その位置だけ
         // スカラー(逐次LCG)で再計算する。
-        let (code, n) = match teamgen::generate_team_from_table(&ring.s, slot, RING - 1, LEAD as usize) {
+        let (code, n) = match teamgen::generate_team_from_table(&ring.hi, slot, RING - 1, LEAD as usize) {
             Some(r) => r,
             None => {
                 local_fallbacks += 1;
