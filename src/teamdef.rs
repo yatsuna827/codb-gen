@@ -14,10 +14,32 @@ pub struct Slot {
     pub ratio: u32,
     pub gender: Gender,
     pub nature: Nature,
+    /// 受理キー範囲の下端(両端含む)。キー = 性格(pid%25)×5 + 性別バケツ(0..5)。
+    /// 「性格一致 かつ 性別一致」⇔「klo <= key <= khi」が厳密に成り立つ
+    /// (色回避は含まない。teamgen_optimized::make_key参照)。
+    pub klo: u8,
+    /// 受理キー範囲の上端(両端含む)。
+    pub khi: u8,
+}
+
+/// (lo & 0xFF)の性別バケツ番号(0..=4)。4つの性別比しきい値
+/// (0x1F/0x3F/0x7F/0xBF)のうちv以下のものの個数。
+/// 実在の性別比ratioはいずれかのしきい値に一致するため、
+/// 「v < ratio」⇔「bucket(v) < bucket(ratio)」が成り立つ。
+pub const fn gender_bucket(v: u32) -> u8 {
+    (v >= 0x1F) as u8 + (v >= 0x3F) as u8 + (v >= 0x7F) as u8 + (v >= 0xBF) as u8
 }
 
 const fn sl(ratio: u32, gender: Gender, nature: Nature) -> Slot {
-    Slot { ratio, gender, nature }
+    // 性別条件をバケツ範囲に変換する。female ⇔ (lo&0xFF) < ratio ⇔ bucket < r。
+    let r = gender_bucket(ratio);
+    let (b_lo, b_hi) = match gender {
+        Gender::NG => (0, 4),
+        Gender::F => (0, r - 1),
+        Gender::M => (r, 4),
+    };
+    let base = (nature as u32 * 5) as u8;
+    Slot { ratio, gender, nature, klo: base + b_lo, khi: base + b_hi }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

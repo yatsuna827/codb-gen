@@ -238,14 +238,24 @@ const LEAD: i64 = 1 << 14;
 /// したがって新しい論理位置pのためのフラグ書き込みは、必ず前の使用者(p-RING)の
 /// クリアより後に起こり、フラグが混線することはない。
 ///
-/// hi配列のみ、位置p+LEADへの先行書き込みで論理位置p+LEAD-RING(= p-(RING-LEAD))の
-/// hiを上書きする。しかし生成が読むhiは[p, p+LEAD]の範囲に限られ、
-/// LEAD < RING-LAG(= 2^17)である限りp+LEAD-RING < p-LAGなので混線しない
-/// (生きているhiの範囲は[p+LEAD-RING, p+LEAD]で、LEADを小さくするほど安全側)。
+/// hi/key配列のみ、位置p+LEAD(keyはp+LEAD-1)への先行書き込みで論理位置
+/// p+LEAD-RING(= p-(RING-LEAD))を上書きする。しかし生成が読むhi/keyは[p, p+LEAD]の
+/// 範囲に限られ、LEAD < RING-LAG(= 2^17)である限りp+LEAD-RING < p-LAGなので混線しない
+/// (生きている範囲は[p+LEAD-RING, p+LEAD]で、LEADを小さくするほど安全側)。
+///
+/// keyp配列は各位置qの受理キー(`teamgen_optimized::make_key(hi[q], hi[q+1])`、
+/// 性格×5+性別バケツの1バイト)をパリティで分割したもの。位置qのキーは
+/// `keyp[q & 1][(q >> 1) & (RING/2 - 1)]`(再抽選の候補はストライド2で並ぶため、
+/// 分割すると1スロットの候補キー列が連続バイトになりSIMDロードが密になる)。
+/// 位置q+1のhiに依存するため、fillはhi[q]を書いた次の反復でkey[q-1]を書く
+/// (生成が読むキーはidx_limit-1 = p+LEAD-1までなので足りる)。
+/// 物理スロットの共有は「q ≡ q' mod RING」のときに限られ(同一パリティで
+/// 半インデックスがmod RING/2で一致 ⇔ mod RINGで一致)、hi配列と同じ生存保証に従う。
 struct Ring {
     c: Vec<u8>,
     n: Vec<u16>,
     hi: Vec<u16>,
+    keyp: [Vec<u8>; 2],
     img: Vec<bool>,
 }
 
@@ -255,6 +265,7 @@ impl Ring {
             c: vec![0u8; RING],
             n: vec![0u16; RING],
             hi: vec![0u16; RING],
+            keyp: [vec![0u8; RING / 2], vec![0u8; RING / 2]],
             img: vec![false; RING],
         }
     }
@@ -262,6 +273,15 @@ impl Ring {
     #[inline(always)]
     fn idx(pos: i64) -> usize {
         (pos as u64 & RING_MASK) as usize
+    }
+
+    /// 位置posのキーをパリティ分割配列へ書き込む。負のposでも
+    /// u64キャストの2の補数表現でパリティ・半インデックスが一貫する
+    /// (2^64 ≡ 0 mod RINGなので、mod RINGの物理対応はRing::idxと同じ)。
+    #[inline(always)]
+    fn put_key(&mut self, pos: i64, key: u8) {
+        let q = pos as u64;
+        self.keyp[(q & 1) as usize][((q >> 1) & (RING_MASK >> 1)) as usize] = key;
     }
 }
 
@@ -301,6 +321,59 @@ fn hop_key_fallback(origin: u32) -> (u64, u32) {
     (k, s)
 }
 
+/// 位置resolve_pを解決する(scan_arcの内部処理)。originはその位置の状態(resolve_sカーソル)。
+/// scanned_uptoはこの時点で走査済み(c/n書き込み済み)の末尾位置で、hop_keyの
+/// フォールバック判定に使う(フォールバックは結果同値なので、走査済み範囲内なら
+/// どの値を渡しても出力は変わらない)。
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn resolve_at(
+    ring: &mut Ring,
+    resolve_p: i64,
+    origin: u32,
+    scanned_upto: i64,
+    scan_start: i64,
+    arc_start: i64,
+    arc_end: i64,
+    buckets: &mut [Vec<Entry>],
+    local_checks: &mut u64,
+) {
+    if resolve_p < scan_start {
+        return;
+    }
+    let rslot = Ring::idx(resolve_p);
+    let is_image = ring.img[rslot];
+    ring.img[rslot] = false; // その場でクリアし、スロット再利用に備える
+    if !is_image {
+        return;
+    }
+    let (k, final_seed) = hop_key(ring, resolve_p, origin, scanned_upto);
+
+    // オンライン自己検査: 全周期で約100万サンプル、決定的、常時有効
+    if origin & 0xFFF == 0 {
+        *local_checks += 1;
+        let mut s = origin;
+        let mut kk: u64 = 0;
+        for _ in 0..7 {
+            kk = kk * 24 + generate_team(&mut s) as u64;
+        }
+        assert!(
+            kk == k && s == final_seed,
+            "self-check failed at origin=0x{:08X}: window(K={}, final=0x{:08X}) != fresh(K={}, final=0x{:08X})",
+            origin,
+            k,
+            final_seed,
+            kk,
+            s
+        );
+    }
+
+    if resolve_p >= arc_start && resolve_p < arc_end {
+        let c1 = (k / 24u64.pow(6)) as usize;
+        buckets[c1].push([(k >> 32) as u32, k as u32, final_seed, origin]);
+    }
+}
+
 /// 軌道上の弧[arc_start, arc_end)を走査・解決し、生成したエントリをc1(0..24)ごとの
 /// バケツに詰めて返す。弧の前段PROLOGUE個の位置(像フラグの伝播のみ)と後段LAG個の位置
 /// (弧内の全位置が解決されるまでのホップ参照用)も合わせて走査するが、
@@ -324,28 +397,45 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
     let resolve_off = (scan_start - LAG).rem_euclid(1i64 << 32) as u32;
     let mut resolve_s = lcg::lcg_jump(0, resolve_off);
 
-    // 乱数値列の先行書き込み: 生成位置が位置pにいるとき、ring.hiは位置p+LEADまで
-    // 書き込み済みであるようにする(チーム生成はring.hi読みのテーブル駆動で行うため)。
+    // 乱数値列の先行書き込み: 生成位置が位置pにいるとき、ring.hiは位置p+LEADまで、
+    // ring.keyは位置p+LEAD-1まで書き込み済みであるようにする(チーム生成は
+    // ring.hi/ring.key読みのテーブル駆動で行うため)。key[q]はhi[q]とhi[q+1]から
+    // 計算するので、hi[q+1]を書いた反復でkey[q]を書く(prev_hiがhi[q]を保持)。
     // まず[scan_start, scan_start+LEAD)を埋め、以降はループ内で1位置ずつ先へ埋める。
+    let mut prev_hi: u16 = 0;
     for q in scan_start..scan_start + LEAD {
-        ring.hi[Ring::idx(q)] = (cur_s >> 16) as u16;
+        let h = (cur_s >> 16) as u16;
+        ring.hi[Ring::idx(q)] = h;
+        if q > scan_start {
+            ring.put_key(q - 1, teamgen_optimized::make_key(prev_hi, h));
+        }
+        prev_hi = h;
         cur_s = lcg::adv(cur_s);
     }
 
     for p in scan_start..scan_end {
-        // 位置p+LEADの乱数値を書き込む(cur_sは常に書き込み位置p+LEADの状態)
-        ring.hi[Ring::idx(p + LEAD)] = (cur_s >> 16) as u16;
+        // 位置p+LEADの乱数値と位置p+LEAD-1のキーを書き込む
+        // (cur_sは常に書き込み位置p+LEADの状態)
+        let h = (cur_s >> 16) as u16;
+        ring.hi[Ring::idx(p + LEAD)] = h;
+        ring.put_key(p + LEAD - 1, teamgen_optimized::make_key(prev_hi, h));
+        prev_hi = h;
         cur_s = lcg::adv(cur_s);
 
-        let slot = Ring::idx(p);
-
-        // 生成位置: 位置pで1回だけチーム生成する。乱数値は書き込み済みのring.hiから
+        // 生成位置: 位置pで1回だけチーム生成する。乱数値は書き込み済みのring.hi/ring.keypから
         // テーブル駆動で読むため、LCGの逐次乗算チェーンを含まない。
         // LEADを追い越す(n>LEAD)稀な位置ではNoneが返るので、その位置だけ
         // スカラー(逐次LCG)で再計算する。位置pの状態はring.sを持たないため
         // lcg_jump(resolve_s, LAG)(= 位置p-LAGの状態をLAGステップ進めた状態)で得る
         // (fallbackほぼ0%・assert失敗0のcold pathのみで評価される)。
-        let (code, n) = match teamgen_optimized::generate_team_from_table(&ring.hi, slot, RING - 1, LEAD as usize) {
+        let slot = Ring::idx(p);
+        let (code, n) = match teamgen_optimized::generate_team_from_table(
+            &ring.hi,
+            [&ring.keyp[0], &ring.keyp[1]],
+            slot,
+            RING - 1,
+            LEAD as usize,
+        ) {
             Some(r) => r,
             None => {
                 local_fallbacks += 1;
@@ -365,41 +455,10 @@ fn scan_arc(arc_start: i64, arc_end: i64, self_checks: &AtomicU64, fallbacks: &A
         ring.img[Ring::idx(p + n as i64)] = true;
 
         // 位置p-LAGを解決する(resolve_sがその状態)
-        let resolve_p = p - LAG;
-        if resolve_p >= scan_start {
-            let rslot = Ring::idx(resolve_p);
-            let is_image = ring.img[rslot];
-            ring.img[rslot] = false; // その場でクリアし、スロット再利用に備える
-            if is_image {
-                let origin = resolve_s;
-                let (k, final_seed) = hop_key(&ring, resolve_p, origin, p);
-
-                // オンライン自己検査: 全周期で約100万サンプル、決定的、常時有効
-                if origin & 0xFFF == 0 {
-                    local_checks += 1;
-                    let mut s = origin;
-                    let mut kk: u64 = 0;
-                    for _ in 0..7 {
-                        kk = kk * 24 + generate_team(&mut s) as u64;
-                    }
-                    assert!(
-                        kk == k && s == final_seed,
-                        "self-check failed at origin=0x{:08X}: window(K={}, final=0x{:08X}) != fresh(K={}, final=0x{:08X})",
-                        origin,
-                        k,
-                        final_seed,
-                        kk,
-                        s
-                    );
-                }
-
-                if resolve_p >= arc_start && resolve_p < arc_end {
-                    let c1 = (k / 24u64.pow(6)) as usize;
-                    buckets[c1].push([(k >> 32) as u32, k as u32, final_seed, origin]);
-                }
-            }
-        }
-
+        resolve_at(
+            &mut ring, p - LAG, resolve_s, p, scan_start, arc_start, arc_end,
+            &mut buckets, &mut local_checks,
+        );
         // 解決カーソルを次の位置(p+1)の p+1-LAG へ進める。
         resolve_s = lcg::adv(resolve_s);
     }
