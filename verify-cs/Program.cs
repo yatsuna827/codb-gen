@@ -12,13 +12,12 @@ using PokemonCOSeedDataBaseAPI;
 //   codb-gen selftest 256 > rs_out.txt
 //   両者が一致すればバトル生成コアはC#ライブラリと同一であることを確認できる。
 //
-// csearchモード(圧縮LightDB、CUML/CNTS両形式対応の動作確認):
+// csearchモード(圧縮LightDBの動作確認):
 //   dotnet run -c Release -- csearch <cldbfile> <hexseed>...
 //   各seedから8回分の観測コードを作り、CompressedLightDBSearcherに渡して
-//   期待seed(8回生成後)が返るか確認する。CUML/CNTSはファイルヘッダのformatタグから
-//   自動判別される。
+//   期待seed(8回生成後)が返るか確認する。
 //
-// benchモード(圧縮LightDB、CUML/CNTS両形式対応の性能測定):
+// benchモード(圧縮LightDBの性能測定):
 //   dotnet run -c Release -- bench <cldbfile> <N>
 //   N個のランダムseed(シード固定で再現可能)について同様の検索を行い、
 //   クエリ1件ごとの所要時間をStopwatchで計測してavg/median/max(ms)を出力する。

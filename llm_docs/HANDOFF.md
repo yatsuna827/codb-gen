@@ -3,10 +3,10 @@
 ## 概要
 
 ポケモンコロシアム「とにかくバトル(シングル最強)」による現在seed特定用データベースの生成コードをRustで実装したもの(本リポジトリ)。
-単一ファイルの圧縮LightDB(CUML/CNTSの2形式、`gen-light` / `query` / `verify-light` / `convert`)を生成・検索できる(コアのチーム生成ロジックは`src/teamgen.rs`、圧縮フォーマットは`src/clight.rs`)。
-`gen-light`の生成はLCG軌道順走査+スライディングウィンドウ方式で、生成中は常時オンライン自己検査(状態の下位12bitが0の像をその場で素直な7回生成と照合)が有効になっている。
+単一ファイルの圧縮LightDBを`gen`で生成し、`query`で検索できる(チーム生成は`src/core/teamgen.rs`、圧縮フォーマットは`src/format.rs`と`src/format/`配下)。
+`gen`の生成はLCG軌道順走査+スライディングウィンドウ方式で、生成中は常時オンライン自己検査(状態の下位12bitが0の像をその場で素直な7回生成と照合)が有効になっている。
 
-- 圧縮フォーマットの詳細設計: `docs/design-compressed-lightdb.md`(正確なファイルレイアウトは`src/clight.rs`冒頭のdocコメントを正とする)
+- 圧縮フォーマットの詳細設計: `docs/design-compressed-lightdb.md`(ファイルレイアウトの定数とヘッダ解析は`src/format.rs`を参照)
 - 生成方式(LCG軌道順走査+スライディングウィンドウ)の詳細設計: `docs/design-orbit-scan.md`
 - 不採用の代替案: `docs/alternative-tmto.md`
 
@@ -27,22 +27,20 @@
 - 像の密度は全状態の**約3.80%**(distinct像数163,104,481/2^32)。理論上は末尾採用PIDの条件(性格×性別の和 = 705/6400 ≈ 0.110)が上界で、逆向きパースの完走率(臨界分岐過程)が掛かる。この完走率は像密度基準で実測**約0.345**。
 - 現物LightDBおよび本ツールの成果物のエントリ数**128,095,165**は像の総数ではなく、**「(キー, 7回生成後seed)のdistinctペア数」**である。異なる像v1≠v2がチーム生成1回で同じ状態に合流し(f(v1)=f(v2))、かつ1回目のコードも同じ場合、行(キー, 生成後seed)は完全に同一になるため、dedup後のエントリ数は像の総数(全状態の約3.80%)より少なくなる。検索出力(生成後seed)としてはこの重複除去は無劣化(同一結果が2回返るところを1回にするだけ)。
 
-## 圧縮LightDB(CUML/CNTS)の成果物と検証
+## 圧縮LightDBの成果物と検証
 
-成果物: `out/lightdb-cuml.cldb`(288,040,890バイト)・`out/lightdb-cnts.cldb`(260,314,978バイト)。
-いずれも128,095,165エントリで、現物LightDBと同一集合。
-CNTSの個数列セクションはzigzag+Rice符号化で実装済み(パラメータk=2。生成時に全kを総当たりして符号長最小のkを選択し、ヘッダ+48にu8で格納)。
+旧ヘッダの成果物`out/lightdb-cnts.cldb`は260,314,978バイト、128,095,165エントリで、現物LightDBと同一集合。現在は32Bヘッダに変更したため、過去のバイト一致記録は現在の生成結果には適用されない。
+個数列セクションはzigzag+Rice符号化で実装済み(パラメータk=2。生成時に全kを総当たりして符号長最小のkを選択し、ヘッダ+24にu8で格納)。
 `out/lightdb-cnts-old6bit.cldb`は旧6bit固定幅方式の退避ファイルで現行コードでは読めない(削除するかはユーザー判断)。
 
 検証済み事項:
 
 - バトル生成コア: `codb-gen selftest 256`と`verify-cs/`(C#ハーネス、PokemonCoRNGLibraryの`GenerateCode`を呼ぶ)の出力が256件完全一致。
 - LCG軌道順走査+スライディングウィンドウ方式による全周期(2^32)の生成出力が、既存成果物`out/lightdb-cnts.cldb`とバイト完全一致(2026-07-05確認、最新の最適化構成でも2026-07-09に再確認。オンライン自己検査は39,896件すべて通過)。所要時間はこのマシン(Intel N150、4スレッド)で初期実装の約37分(走査2192秒)から現在**約5.0分(走査295.3秒+ソート5.6秒+書き出し2.0秒)**まで短縮済み。
-- `verify-light`でエントリ数・チェックサム・単調性がOK(両ファイル共)。
-- `convert`によるCUML/CNTS相互変換は往復(cnts→cuml→cnts)でバイト完全一致。
+- `verify`でエントリ数・チェックサム・個数列の総和がOK。
 - ランダム20seedの観測列で`query`が全件HITし、同一20seedをC#実物Searcher(`PokemonCOSeedDataBaseAPI`、現物LightDB)で検索した結果と全件一致。
-- 検索側C#サンプル実装`verify-cs/CompressedLightDBSearcher.cs`(ヘッダのformatタグからCUML/CNTSを自動判別し、プレフィックス表参照+下位16bit全探索・前向きシミュレートで`Search((PlayerName,BattleTeam)[8]) -> IEnumerable<uint>`を実装)でも既知seed検索が全件HIT。
-- クエリレイテンシ実測(Intel N150、`verify-cs bench`、プロセス起動込み):CUMLはN=300で平均約395ms/中央値約388ms/最大約781ms(追試N=50で平均約414ms/最大約641ms)、CNTSはN=100(先頭1件除く99件集計)で平均399.97ms/中央値392.55ms/最大811.05ms(オープン時のRice復号+チェックポイント構築は約218ms)。いずれも要件「1クエリ1秒以内」を満たす。
+- 検索側C#サンプル実装`verify-cs/CompressedLightDBSearcher.cs`(個数列のチェックポイント参照+下位16bit全探索・前向きシミュレートで`Search((PlayerName,BattleTeam)[8]) -> IEnumerable<uint>`を実装)でも既知seed検索が全件HIT。
+- クエリレイテンシ実測(Intel N150、`verify-cs bench`、プロセス起動込み):旧ヘッダの個数列形式はN=100(先頭1件除く99件集計)で平均399.97ms/中央値392.55ms/最大811.05ms(オープン時のRice復号+チェックポイント構築は約218ms)。
 
 ## 生成の高速化(実装済み)
 
@@ -59,7 +57,7 @@ CNTSの個数列セクションはzigzag+Rice符号化で実装済み(パラメ�
 要点:
 
 - **乱数値の共有(テーブル駆動生成)**: 位置jの生成が消費する乱数列s_{j+1}..s_{j+n}の上位16bitはリングバッファ`ring.s`に既に格納しているsそのもの。状態列の書き込みを生成位置より`LEAD`位置先行させ(1位置あたりLCG1ステップ)、チーム生成を`ring.s`読みのテーブル駆動(`teamgen::generate_team_from_table`)に変えて、生成内部の逐次LCG乗算チェーンを消した。ただし**これ単体ではパリティ止まり**だった(テーブル読みのロードレイテンシが乗算チェーンとほぼ同等)。素朴実装ではLLVMが後続の乱数消費位置をidxのアフィン式として先行計算し、それらを同時に多数保持するためレジスタが不足して逆に2.6倍悪化した。`get_unchecked`(境界チェック除去)で解消したが、真に効いたのは次項。
-- **LEAD縮小(キャッシュ局所性)**: `LEAD`は当初「消費数nの上界(u16::MAX)以上」で`2^16`に取っていたが、fillが65,536先で書くため読むまでにキャッシュから追い出されていた。平均nに近い`LEAD=2^14`(16,384)へ縮め、fill(書き)と生成(読み)を時間的に近接させた。n>LEADの稀な位置は`generate_team_from_table`が`None`を返し、呼び出し側がスカラー(`generate_team_with_count`)で再計算するフォールバックで救う(`LEAD < RING-LAG=2^17`ならスロット再利用は安全、値を小さくするほど安全側)。LEAD=16,384ではフォールバック率0%。効果は数%でこのマシンの実測ノイズと同程度。
+- **LEAD縮小(キャッシュ局所性)**: `LEAD`は当初「消費数nの上界(u16::MAX)以上」で`2^16`に取っていたが、fillが65,536先で書くため読むまでにキャッシュから追い出されていた。`LEAD=2^14`(16,384)へ縮め、fill(書き)と生成(読み)を時間的に近接させた。当初はn>LEADでスカラー再計算していたが、全周期で超過0件を確認した現在は超過時に停止する。効果は数%でこのマシンの実測ノイズと同程度。
 - **再抽選ループのバッチ走査(SIMD)**: gen_slotの再抽選を、テーブル経路専用に`B=16`候補ずつ連続スライス上でまとめて評価する形(`teamgen::gen_slot_table`)に書き換えた。受理判定をバッチ内で計算しビットマスクの最下位1bitで最初の受理候補を取る。リングの折り返しをまたぐバッチのみスカラーにフォールバックする。この形にするとレジスタ不足が起きず、かつLLVMが自動ベクトル化してAVX2(ymm、`pid % 25`の乗算逆数化・比較・マスクを8レーン)で走る。Bは8/16/32を実測してB=16が最良。手書きAVX2組み込みは自動ベクトル化で既にymm化されたため不要。
 - スカラー経路(`generate_team`/`generate_team_checked`、selftest・query・オンライン自己検査が使う)は無変更のまま。テーブル経路の正しさはオンライン自己検査(テーブル合成をスカラー再計算と照合)と部分実行のバイト一致で担保している。
 
@@ -81,7 +79,7 @@ CNTSの個数列セクションはzigzag+Rice符号化で実装済み(パラメ�
 走査部がさらに高速化(全周期`limit=2^32`の実測で走査1,242秒→**1,222.5秒**)。部分実行`limit=0x2000000`では中立だが、全周期のサーマルスロットリング下で効く(書き込みトラフィック=消費電力の削減が持続クロックに効く)。出力はバイト完全不変(全周期`out/lightdb-cnts.cldb`一致)。設計の詳細は`docs/design-orbit-scan.md`「状態列ring.sの廃止」。
 要点:
 
-- `ring.s`(u32、RINGぶんで1MB)は毎位置100%書き込みしていたが、読むのは像(約3.8%)の起点seedと最終seedだけ。配列を廃止し、起点seedは`p-LAG`を追うカーソル`resolve_s`(毎位置1ステップ)で、最終seedは`lcg_jump(起点, ホップ距離)`で像のときだけ算出、fallback時の状態は`lcg_jump(resolve_s, LAG)`でその場算出。fillの書き込みが位置あたり6バイト→2バイト(u16のhiのみ)になり、1MBぶんのキャッシュ圧も消える。
+- `ring.s`(u32、RINGぶんで1MB)は毎位置100%書き込みしていたが、読むのは像(約3.8%)の起点seedと最終seedだけ。配列を廃止し、起点seedは`p-LAG`を追うカーソル`resolve_s`(毎位置1ステップ)で、最終seedは`lcg_jump(起点, ホップ距離)`で像のときだけ算出する。fillの書き込みが位置あたり6バイト→2バイト(u16のhiのみ)になり、1MBぶんのキャッシュ圧も消える。
 
 **追加採用(2026-07-07): 再抽選バッチの手書きAVX2化(vmovmskps畳み込み)**。
 走査部がさらに約10%高速化(部分実行`limit=0x2000000`で中央値10.7秒→9.65秒。全周期`limit=2^32`の実測で走査1,222.5秒→**1,092.8秒**、生成全体**18.3分**)。出力はバイト完全不変(全周期`out/lightdb-cnts.cldb`一致・`table_path_matches_scalar`厳密照合・自己検査全通過)。設計の詳細は`docs/design-orbit-scan.md`「再抽選バッチの手書きAVX2化」。
@@ -118,11 +116,11 @@ PGOは`llvm-tools-preview`で2段(profile-generate→llvm-profdata merge→profi
 cargo test
 ```
 
-- `teamgen::tests::core_golden`: selftest相当の生成結果(4096件)のFNVハッシュを固定値と照合。値はC#参照実装と一致確認済みの現行挙動を固定したもの。生成コアが変わると落ちる。
-- `teamgen::tests::generate_team_checked_consistency`: `generate_team_checked`が`generate_team`と整合(query側の照合の正しさ)。
+- `core::teamgen::tests::core_golden`: selftest相当の生成結果(4096件)のFNVハッシュを固定値と照合。値はC#参照実装と一致確認済みの現行挙動を固定したもの。生成コアが変わると落ちる。
+- `core::teamgen::tests::generate_team_checked_consistency`: `generate_team_checked`が`generate_team`と整合(query側の照合の正しさ)。
 - `teamgen_optimized::tests::table_path_matches_scalar`: テーブル駆動生成(乱数値共有+受理キーの最適化経路)がスカラー生成と(code, n, 最終状態)完全一致。
 - `teamgen_optimized::tests::key_encoding_matches_accept_condition`: 受理キー符号化(make_key/klo/khi)がスロットの受理条件(性格・性別)と全スロット×全性格×全性別バイトで厳密等価。
-- `clight::tests::thread_invariance_and_selfcheck`: 小limitでthreads=1と4の出力がバイト一致。実行中にgen-light内蔵のオンライン自己検査も駆動される。
+- `cli::tests::thread_invariance_and_selfcheck`: 小limitでthreads=1と4の出力がバイト一致。実行中にgen-light内蔵のオンライン自己検査も駆動される。
 
 生成のベンチと部分実行のsha256回帰チェック:
 
@@ -130,8 +128,7 @@ cargo test
 bash scripts/gen-check.sh
 ```
 
-(limit=0x1000000・threads=4で生成し、sha256を埋め込み期待値と照合してphase1+2の最小/中央値を出力。
-全周期のバイト一致は別途`gen-light`を全周期実行して`out/lightdb-cnts.cldb`と`cmp`する最終確認で行う)
+(limit=0x1000000・threads=4で生成し、sha256を埋め込み期待値と照合してphase1+2の最小/中央値を出力)
 
 バトル生成コアのC#参照実装との一致確認(C#環境が要る。golden定数の元になった確認):
 
@@ -140,7 +137,7 @@ codb-gen selftest 256 > rs_out.txt
 cd verify-cs && dotnet run -c Release -- 256 > cs_out.txt
 ```
 
-圧縮LightDB(CUML/CNTS)の既知seed検索・ベンチマーク:
+圧縮LightDBの既知seed検索・ベンチマーク:
 
 ```
 cd verify-cs

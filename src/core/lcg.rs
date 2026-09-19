@@ -15,9 +15,7 @@ pub fn adv(s: u32) -> u32 {
     s.wrapping_mul(A).wrapping_add(B)
 }
 
-/// LCGを任意ステップ数kだけ進めた状態を返す。
-/// (乗数, 加数)の対を繰り返し二乗して合成する、O(log k)のジャンプ関数。
-/// kはu32全域(2^32を法とするステップ数)を表せる。
+/// LCGをk消費する。戻り値は更新後のseed。
 pub fn lcg_jump(s: u32, mut k: u32) -> u32 {
     let mut acc_a: u32 = 1;
     let mut acc_b: u32 = 0;

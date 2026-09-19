@@ -1,7 +1,7 @@
 //! ポケモンコロシアムの「とにかくバトル」の「シングル・最強」のチーム生成処理
 
-use crate::lcg;
-use crate::teamdef::{Slot, F, NG, TEAMS};
+use super::lcg;
+use super::teamdef::{Slot, F, NG, TEAMS};
 
 /// 1回分のチーム生成。戻り値はコード。
 #[inline(always)]
@@ -31,42 +31,6 @@ pub fn generate_team(s: &mut u32) -> u32 {
 
     // コード化
     name * 8 + p as u32
-}
-
-/// 1回分のチーム生成。戻り値は (コード, LCGの消費数)。
-#[inline(always)]
-pub fn generate_team_with_count(s: &mut u32) -> (u32, u32) {
-    let mut n = 0u32;
-    // 相手チーム決定
-    let e = (lcg::rand(s) & 7) as usize;
-    n += 1;
-    // 自チーム決定
-    let p = loop {
-        let p = (lcg::rand(s) & 7) as usize;
-        n += 1;
-        if p != e {
-            break p;
-        }
-    };
-
-    // 相手チーム生成
-    let etsv = lcg::rand(s) ^ lcg::rand(s);
-    n += 2;
-    for slot in &TEAMS[e] {
-        n += adv_gen_slot(s, slot, etsv);
-    }
-    // 自トレーナー名決定
-    let name = lcg::rand(s) % 3;
-    n += 1;
-    // 自チーム生成
-    let ptsv = lcg::rand(s) ^ lcg::rand(s);
-    n += 2;
-    for slot in &TEAMS[p] {
-        n += adv_gen_slot(s, slot, ptsv);
-    }
-
-    // コード化
-    (name * 8 + p as u32, n)
 }
 
 /// 生成されるチームが`code`で指定されたものと一致するかを判定する。
@@ -175,7 +139,10 @@ mod tests {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let hash = fnv1a64(&bytes);
-        assert_eq!(hash, 0x41DE_69D3_5AA3_8328, "core_golden hash mismatch (regression in teamgen generation logic)");
+        assert_eq!(
+            hash, 0x41DE_69D3_5AA3_8328,
+            "core_golden hash mismatch (regression in teamgen generation logic)"
+        );
     }
 
     /// generate_team_checkedが「スカラー生成と同じcodeならtrueかつ最終seedも一致」
@@ -198,5 +165,4 @@ mod tests {
             assert!(!generate_team_checked(&mut s3, (code + 1) % 24));
         }
     }
-
 }
